@@ -19,14 +19,15 @@ final class BLELink: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
-    /// Küldés max. 20 Hz-en, és csak ha legalább 2 µs-ot változott (force: mindig).
+    /// Küldés max. 30 Hz-en, csak ha változott (force: mindig).
     func send(us: Int, force: Bool = false) {
         guard let p = peripheral, let t = target else { return }
         let now = Date()
-        if !force && (abs(us - lastSent) < 2 || now.timeIntervalSince(lastTime) < 0.05) { return }
+        if !force && (us == lastSent || now.timeIntervalSince(lastTime) < 0.033) { return }
         lastSent = us
         lastTime = now
-        p.writeValue(Data(String(us).utf8), for: t, type: .withResponse)
+        let type: CBCharacteristicWriteType = t.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        p.writeValue(Data(String(us).utf8), for: t, type: type)
     }
 
     private func scan() {

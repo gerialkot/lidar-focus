@@ -23,6 +23,6 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: hu.lidarfocus.app
         TARGETED_DEVICE_FAMILY: "1"
         SWIFT_VERSION: "5.0"
-        MARKETING_VERSION: "0.1"
+        MARKETING_VERSION: "0.2"
         CURRENT_PROJECT_VERSION: "1"
         CODE_SIGNING_ALLOWED: "NO"
