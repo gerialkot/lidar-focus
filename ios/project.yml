@@ -1,0 +1,28 @@
+name: LiDARFocus
+options:
+  bundleIdPrefix: hu.lidarfocus
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  LiDARFocus:
+    type: application
+    platform: iOS
+    sources: [LiDARFocus]
+    info:
+      path: LiDARFocus/Info.plist
+      properties:
+        CFBundleDisplayName: LiDAR Focus
+        UILaunchScreen: {}
+        NSCameraUsageDescription: A kamera és a LiDAR kell a célpont követéséhez és a távolság méréséhez.
+        NSBluetoothAlwaysUsageDescription: A Bluetooth kell az ESP32 élességállító szervó vezérléséhez.
+        UIRequiredDeviceCapabilities: [arkit]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIStatusBarHidden: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: hu.lidarfocus.app
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGNING_ALLOWED: "NO"
