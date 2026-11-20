@@ -12,22 +12,46 @@ final class BLELink: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     private var peripheral: CBPeripheral?
     private var target: CBCharacteristic?
     private var lastSent = -1
-    private var lastTime = Date.distantPast
 
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
-    /// Küldés max. 30 Hz-en, csak ha változott (force: mindig).
+    private var pendingUs: Int?
+    private var inFlight = false
+
+    /// Mindig csak a LEGFRISSEBB érték megy ki: ha a Bluetooth még foglalt,
+    /// a köztes értékek eldobódnak, így nem gyűlik fel késés.
     func send(us: Int, force: Bool = false) {
-        guard let p = peripheral, let t = target else { return }
-        let now = Date()
-        if !force && (us == lastSent || now.timeIntervalSince(lastTime) < 0.033) { return }
+        guard peripheral != nil, target != nil else { return }
+        if !force && us == lastSent && pendingUs == nil { return }
+        pendingUs = us
+        flush()
+    }
+
+    private func flush() {
+        guard let p = peripheral, let t = target, let us = pendingUs else { return }
+        let data = Data(String(us).utf8)
+        if t.properties.contains(.writeWithoutResponse) {
+            guard p.canSendWriteWithoutResponse else { return }   // peripheralIsReady hívja újra
+            p.writeValue(data, for: t, type: .withoutResponse)
+        } else {
+            guard !inFlight else { return }                       // didWriteValueFor hívja újra
+            inFlight = true
+            p.writeValue(data, for: t, type: .withResponse)
+        }
         lastSent = us
-        lastTime = now
-        let type: CBCharacteristicWriteType = t.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-        p.writeValue(Data(String(us).utf8), for: t, type: type)
+        pendingUs = nil
+    }
+
+    func peripheral(_ p: CBPeripheral, didWriteValueFor c: CBCharacteristic, error: Error?) {
+        inFlight = false
+        flush()
+    }
+
+    func peripheralIsReady(toSendWriteWithoutResponse p: CBPeripheral) {
+        flush()
     }
 
     private func scan() {
@@ -65,6 +89,8 @@ final class BLELink: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         target = nil
         peripheral = nil
         lastSent = -1
+        pendingUs = nil
+        inFlight = false
         scan()
     }
 
