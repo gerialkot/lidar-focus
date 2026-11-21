@@ -16,10 +16,14 @@ final class BLELink: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
+        watchdog = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
     }
 
     private var pendingUs: Int?
     private var inFlight = false
+    private var inFlightSince = Date.distantPast
+    private var lastAck = Date()
+    private var watchdog: Timer?
 
     /// Mindig csak a LEGFRISSEBB érték megy ki: ha a Bluetooth még foglalt,
     /// a köztes értékek eldobódnak, így nem gyűlik fel késés.
@@ -30,28 +34,39 @@ final class BLELink: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         flush()
     }
 
+    /// Mindig nyugtázott írás (withResponse). A válasz nélküli írást szándékosan nem használjuk:
+    /// iOS-en a canSendWriteWithoutResponse egy idő után tartósan false-on ragadhat, és a
+    /// peripheralIsReady sem jön meg -> az app örökre vár (ettől állt le a motor).
     private func flush() {
-        guard let p = peripheral, let t = target, let us = pendingUs else { return }
-        let data = Data(String(us).utf8)
-        if t.properties.contains(.writeWithoutResponse) {
-            guard p.canSendWriteWithoutResponse else { return }   // peripheralIsReady hívja újra
-            p.writeValue(data, for: t, type: .withoutResponse)
-        } else {
-            guard !inFlight else { return }                       // didWriteValueFor hívja újra
-            inFlight = true
-            p.writeValue(data, for: t, type: .withResponse)
-        }
+        guard let p = peripheral, let t = target, let us = pendingUs, !inFlight else { return }
+        inFlight = true
+        inFlightSince = Date()
+        p.writeValue(Data(String(us).utf8), for: t, type: .withResponse)
         lastSent = us
         pendingUs = nil
     }
 
     func peripheral(_ p: CBPeripheral, didWriteValueFor c: CBCharacteristic, error: Error?) {
         inFlight = false
+        lastAck = Date()
         flush()
     }
 
-    func peripheralIsReady(toSendWriteWithoutResponse p: CBPeripheral) {
-        flush()
+    /// Őrkutya: ha egy írásra 1,5 s alatt nem jön nyugta, a kapcsolat beragadt -> bontás és újracsatlakozás
+    /// (ugyanaz, amit az app újraindítása csinált). Mozgás nélkül másodpercenként életjelet küld,
+    /// hogy a beragadás akkor is kiderüljön, ha épp nincs új érték.
+    private func tick() {
+        guard let p = peripheral, target != nil else { return }
+        let now = Date()
+        if inFlight && now.timeIntervalSince(inFlightSince) > 1.5 {
+            state = "Kapcsolat beragadt, újracsatlakozás…"
+            central.cancelPeripheralConnection(p)   // didDisconnect -> reset() -> újrakeresés
+            return
+        }
+        if !inFlight && pendingUs == nil && lastSent >= 0 && now.timeIntervalSince(lastAck) > 1.0 {
+            pendingUs = lastSent
+            flush()
+        }
     }
 
     private func scan() {
@@ -103,6 +118,7 @@ final class BLELink: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
         if let c = s.characteristics?.first(where: { $0.uuid == targetUUID }) {
             target = c
+            lastAck = Date()
             connected = true
             state = "ESP32 csatlakozva"
         }
