@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var manualUs: Double = 1500
     @State private var outputUs: Int = 1500
     @State private var showProfiles = false
+    @State private var dragRect: CGRect?
 
     var body: some View {
         ZStack {
@@ -43,12 +44,34 @@ struct ContentView: View {
                 ZStack {
                     ARCameraView(session: engine.session)
                     TargetOverlay(engine: engine, size: geo.size)
+                    if let r = dragRect {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.amber, style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+                            .background(Color.amber.opacity(0.08))
+                            .frame(width: r.width, height: r.height)
+                            .position(x: r.midX, y: r.midY)
+                            .allowsHitTesting(false)
+                    }
                 }
                 .contentShape(Rectangle())
-                .onTapGesture { p in
-                    engine.tap(at: p, viewSize: geo.size)
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                }
+                // Bökés: ember vagy tárgy (a LiDAR mélység alapján körbehatárolva). Húzás: keret a tárgy köré.
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { v in
+                            let r = CGRect(x: min(v.startLocation.x, v.location.x), y: min(v.startLocation.y, v.location.y),
+                                           width: abs(v.location.x - v.startLocation.x), height: abs(v.location.y - v.startLocation.y))
+                            if dragRect != nil || max(r.width, r.height) > 14 { dragRect = r }
+                        }
+                        .onEnded { v in
+                            if let r = dragRect, r.width > 24, r.height > 24 {
+                                engine.select(box: r, viewSize: geo.size)
+                            } else {
+                                engine.tap(at: v.startLocation, viewSize: geo.size)
+                            }
+                            dragRect = nil
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        }
+                )
             }
             .ignoresSafeArea()
 
@@ -139,7 +162,7 @@ struct ContentView: View {
             if autoMode {
                 HStack(spacing: 8) {
                     Image(systemName: "sparkles")
-                    Text(engine.state == .idle ? "Bökj a célpontra a képen" : "Az élesség követi a célpontot")
+                    Text(engine.state == .idle ? "Bökj a célpontra, vagy húzz keretet köré" : "Az élesség követi a célpontot")
                     Spacer()
                 }
                 .font(.footnote.weight(.medium))
@@ -224,7 +247,7 @@ struct DistanceReadout: View {
 
     private var subtitle: String {
         switch engine.state {
-        case .idle: return "BÖKJ A CÉLPONTRA"
+        case .idle: return "BÖKJ VAGY HÚZZ KERETET"
         case .searching: return "CÉLPONT KERESÉSE…"
         case .tracking:
             if engine.kind == .object { return "TÁRGY · LIDAR" }
@@ -414,6 +437,8 @@ struct ProfilesSheet: View {
     @State private var showNew = false
     @State private var renameText = ""
     @State private var showRename = false
+    @State private var deleteTarget: LensProfile?
+    @State private var confirmClear = false
 
     var body: some View {
         NavigationStack {
@@ -437,10 +462,10 @@ struct ProfilesSheet: View {
                                 }
                             }
                         }
-                    }
-                    .onDelete { idx in
-                        let ids = idx.map { store.profiles[$0].id }
-                        ids.forEach { store.delete($0) }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button { deleteTarget = p } label: { Label("Törlés", systemImage: "trash") }
+                                .tint(.red)
+                        }
                     }
                     Button { newName = ""; showNew = true } label: {
                         Label("Új profil", systemImage: "plus")
@@ -461,18 +486,25 @@ struct ProfilesSheet: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                    let owner = store.activeID
                     ForEach(sortedPoints) { pt in
                         HStack {
                             Text(String(format: "%.2f m", pt.distance)).monospacedDigit()
                             Spacer()
                             Text("\(pt.us) µs").monospacedDigit().foregroundStyle(.secondary)
                         }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button {
+                                store.update(owner) { $0.points.removeAll { $0.id == pt.id } }
+                            } label: { Label("Törlés", systemImage: "trash") }
+                                .tint(.red)
+                        }
                     }
-                    .onDelete { idx in
-                        let ids = Set(idx.map { sortedPoints[$0].id })
-                        store.updateActive { $0.points.removeAll { ids.contains($0.id) } }
+                    if !store.active.points.isEmpty {
+                        Button("Összes pont törlése", role: .destructive) { confirmClear = true }
                     }
                 }
+                .id(store.activeID)   // profilváltáskor a lista teljesen újraépül, nem keveredik
             }
             .scrollContentBackground(.hidden)
             .navigationTitle("Objektívek")
@@ -487,6 +519,20 @@ struct ProfilesSheet: View {
                     let n = newName.trimmingCharacters(in: .whitespaces)
                     store.add(name: n.isEmpty ? "Új objektív" : n)
                 }
+            }
+            .confirmationDialog("„\(deleteTarget?.name ?? "")” törlése a kalibrációs pontjaival együtt?",
+                                isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }),
+                                titleVisibility: .visible) {
+                Button("Profil törlése", role: .destructive) {
+                    if let id = deleteTarget?.id { store.delete(id) }
+                    deleteTarget = nil
+                }
+                Button("Mégse", role: .cancel) { deleteTarget = nil }
+            }
+            .confirmationDialog("Törlöd „\(store.active.name)” összes kalibrációs pontját?",
+                                isPresented: $confirmClear, titleVisibility: .visible) {
+                let owner = store.activeID
+                Button("Összes törlése", role: .destructive) { store.update(owner) { $0.points.removeAll() } }
             }
             .alert("Átnevezés", isPresented: $showRename) {
                 TextField("Név", text: $renameText)

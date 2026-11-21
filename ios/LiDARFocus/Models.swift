@@ -48,7 +48,11 @@ struct LensProfile: Codable, Identifiable, Equatable {
 final class ProfileStore: ObservableObject {
     @Published var profiles: [LensProfile] { didSet { save() } }
     @Published var activeID: UUID {
-        didSet { UserDefaults.standard.set(activeID.uuidString, forKey: activeKey) }
+        didSet {
+            // Sosem mutathat törölt profilra (ez okozta a "szellem" profilt és a rossz helyre mentett pontokat)
+            if !profiles.contains(where: { $0.id == activeID }) { activeID = profiles[0].id; return }
+            UserDefaults.standard.set(activeID.uuidString, forKey: activeKey)
+        }
     }
 
     private let key = "lens.profiles"
@@ -69,6 +73,7 @@ final class ProfileStore: ObservableObject {
             }
             loaded = [first]
         }
+        UserDefaults.standard.removeObject(forKey: "calibration.points")   // régi kalibráció csak egyszer jöjjön át
         let savedID = UserDefaults.standard.string(forKey: activeKey).flatMap(UUID.init(uuidString:))
         profiles = loaded
         activeID = loaded.first(where: { $0.id == savedID })?.id ?? loaded[0].id
@@ -80,8 +85,15 @@ final class ProfileStore: ObservableObject {
     }
 
     func updateActive(_ change: (inout LensProfile) -> Void) {
-        guard let i = profiles.firstIndex(where: { $0.id == activeID }) else { return }
-        change(&profiles[i])
+        update(activeID, change)
+    }
+
+    /// Mindig a megadott azonosítójú profilt módosítja, sosem egy másikat.
+    func update(_ id: UUID, _ change: (inout LensProfile) -> Void) {
+        guard let i = profiles.firstIndex(where: { $0.id == id }) else { return }
+        var p = profiles[i]
+        change(&p)
+        profiles[i] = p
     }
 
     func add(name: String) {
@@ -90,10 +102,12 @@ final class ProfileStore: ObservableObject {
         activeID = p.id
     }
 
+    /// Törlés. Az utolsó profil helyett egy üres, új profil jön létre, így a törlés mindig tényleges.
     func delete(_ id: UUID) {
-        guard profiles.count > 1 else { return }
-        profiles.removeAll { $0.id == id }
-        if activeID == id { activeID = profiles[0].id }
+        var list = profiles.filter { $0.id != id }
+        if list.isEmpty { list = [LensProfile(name: "Alap objektív")] }
+        profiles = list
+        if !list.contains(where: { $0.id == activeID }) { activeID = list[0].id }
     }
 
     private func save() {

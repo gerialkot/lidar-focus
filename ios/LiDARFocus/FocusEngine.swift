@@ -31,8 +31,9 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
     private var trackRequest: VNTrackObjectRequest?
 
     private var semantics: ARConfiguration.FrameSemantics = []
+    private enum Pending { case tap(CGPoint), box(CGRect) }
     private var viewSize: CGSize = .zero
-    private var pendingTap: CGPoint?
+    private var pending: Pending?
     private var targetKind: TargetKind = .person
     private var targetRect: CGRect?
     private var faceRect: CGRect?
@@ -79,7 +80,17 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
         let norm = CGPoint(x: point.x / size.width, y: point.y / size.height)
         queue.async {
             self.viewSize = size
-            self.pendingTap = norm
+            self.pending = .tap(norm)
+        }
+    }
+
+    /// Kézzel húzott keret (képernyő pontokban).
+    func select(box r: CGRect, viewSize size: CGSize) {
+        let norm = CGRect(x: r.minX / size.width, y: r.minY / size.height,
+                          width: r.width / size.width, height: r.height / size.height)
+        queue.async {
+            self.viewSize = size
+            self.pending = .box(norm)
         }
     }
 
@@ -106,7 +117,7 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
         guard viewSize != .zero else { return }
         frameCount += 1
         let toView = frame.displayTransform(for: .portrait, viewportSize: viewSize)
-        let runDetect = frameCount % 2 == 0 || pendingTap != nil
+        let runDetect = frameCount % 2 == 0 || pending != nil
 
         // 1) Ember- és arckeresés (30 Hz)
         if runDetect {
@@ -117,9 +128,13 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         // 2) Új kijelölés
-        if let tap = pendingTap {
-            pendingTap = nil
-            select(at: tap.applying(toView.inverted()))
+        if let p = pending {
+            pending = nil
+            let inv = toView.inverted()
+            switch p {
+            case .tap(let pt): select(at: pt.applying(inv), frame: frame)
+            case .box(let r): startObject(r.applying(inv).standardized.intersection(unitRect), frame: frame)
+            }
         }
 
         // 3) Célpont frissítése
@@ -137,15 +152,22 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
                     faceRect = nil
                 }
             case .object:
-                if let req = trackRequest {
-                    var ok = false
-                    if (try? sequenceHandler.perform([req], on: frame.capturedImage, orientation: .right)) != nil,
-                       let obs = req.results?.first as? VNDetectedObjectObservation, obs.confidence > 0.3 {
-                        req.inputObservation = obs
-                        targetRect = rawRect(fromVision: obs.boundingBox)
-                        ok = true
-                    }
-                    missed = ok ? 0 : missed + 1
+                var ok = false
+                if let req = trackRequest,
+                   (try? sequenceHandler.perform([req], on: frame.capturedImage, orientation: .right)) != nil,
+                   let obs = req.results?.first as? VNDetectedObjectObservation, obs.confidence > 0.3 {
+                    req.inputObservation = obs
+                    targetRect = rawRect(fromVision: obs.boundingBox)
+                    ok = true
+                }
+                if ok {
+                    missed = 0
+                    // A képkövető lassan elcsúszhat: fél másodpercenként a LiDAR mélységfolt alapján igazítjuk
+                    if frameCount % 30 == 0 { refineObject(frame: frame, reinitOnly: false) }
+                } else {
+                    missed += 1
+                    // Elveszett: az utolsó helyen, azonos távolságban keressük újra
+                    if missed % 8 == 0 { refineObject(frame: frame, reinitOnly: true) }
                 }
             }
         }
@@ -160,7 +182,10 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
                 if d == nil { d = sampleDepth(r, shrink: 0.15, useMask: true, percentile: 0.5, frame: frame) }
                 if d == nil { d = sampleDepth(r, shrink: 0.5, useMask: false, percentile: 0.3, frame: frame) }
             } else {
-                d = sampleDepth(r, shrink: 0.5, useMask: false, percentile: 0.3, frame: frame)
+                // Csak a tárgy mélységéhez közeli pontok számítanak, a mögötte lévő háttér nem húzza el
+                d = sampleDepth(r, shrink: 0.4, useMask: false, percentile: filtered == nil ? 0.3 : 0.5,
+                                near: filtered, frame: frame)
+                    ?? sampleDepth(r, shrink: 0.5, useMask: false, percentile: 0.3, frame: frame)
             }
             if let d {
                 filtered = Float(filter.filter(Double(d), time: frame.timestamp))
@@ -184,27 +209,148 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    private func select(at p: CGPoint) {
-        if let h = humans.filter({ $0.contains(p) }).min(by: { area($0) < area($1) }) {
+    /// Bökés: ha ténylegesen emberre (az ARKit emberpixelére) bökött, az embert követi;
+    /// különben a bökött pont körüli, azonos távolságú LiDAR foltot jelöli ki tárgyként.
+    private func select(at p: CGPoint, frame: ARFrame) {
+        let human = humans.filter { $0.contains(p) }.min { area($0) < area($1) }
+        if let h = human, isPersonPixel(p, frame: frame) ?? true {
             targetKind = .person
             targetRect = h
             trackRequest = nil
-        } else {
-            targetKind = .object
-            let half: CGFloat = 0.07
-            let r = CGRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)
-                .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-            let req = VNTrackObjectRequest(detectedObjectObservation:
-                VNDetectedObjectObservation(boundingBox: visionRect(fromRaw: r)))
-            req.trackingLevel = .accurate
-            trackRequest = req
-            targetRect = r
+            faceRect = nil
+            active = true
+            missed = 0
+            filter.reset()
+            filtered = nil
+            return
         }
+        let half: CGFloat = 0.07
+        let r = depthRegion(at: p, frame: frame)?.rect
+            ?? CGRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2).intersection(unitRect)
+        startObject(r, frame: frame)
+    }
+
+    private func startObject(_ r: CGRect, frame: ARFrame) {
+        guard !r.isNull, r.width > 0.01, r.height > 0.01 else { return }
+        targetKind = .object
+        targetRect = r
+        makeTracker(r)
         faceRect = nil
         active = true
         missed = 0
         filter.reset()
         filtered = nil
+    }
+
+    private func makeTracker(_ r: CGRect) {
+        let req = VNTrackObjectRequest(detectedObjectObservation:
+            VNDetectedObjectObservation(boundingBox: visionRect(fromRaw: r)))
+        req.trackingLevel = .accurate
+        trackRequest = req
+    }
+
+    /// LiDAR-alapú igazítás/újrakeresés: a keret közepén lévő, az eddigi távolsághoz illő mélységfolt.
+    private func refineObject(frame: ARFrame, reinitOnly: Bool) {
+        guard let last = targetRect, let ref = filtered,
+              let reg = depthRegion(at: CGPoint(x: last.midX, y: last.midY), frame: frame),
+              abs(reg.depth - ref) < max(0.12, ref * 0.12) else { return }
+        let ratio = area(reg.rect) / max(area(last), 1e-6)
+        if reinitOnly {
+            guard ratio > 0.2, ratio < 5 else { return }
+            targetRect = reg.rect
+            missed = 0
+        } else {
+            guard ratio > 0.4, ratio < 2.5 else { return }
+            targetRect = lerp(last, reg.rect, 0.5)
+        }
+        makeTracker(targetRect!)
+    }
+
+    /// Az ARKit személyszegmentálása szerint ember-e a pont (nil, ha nincs szegmentálás).
+    private func isPersonPixel(_ p: CGPoint, frame: ARFrame) -> Bool? {
+        guard let seg = frame.segmentationBuffer else { return nil }
+        CVPixelBufferLockBaseAddress(seg, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(seg, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(seg) else { return nil }
+        let w = CVPixelBufferGetWidth(seg), h = CVPixelBufferGetHeight(seg)
+        let row = CVPixelBufferGetBytesPerRow(seg)
+        let cx = min(w - 1, max(0, Int(p.x * CGFloat(w)))), cy = min(h - 1, max(0, Int(p.y * CGFloat(h))))
+        // 5x5 környezet, hogy a szegmentálás széle ne döntsön véletlenül
+        var hits = 0, total = 0
+        for y in max(0, cy - 2)...min(h - 1, cy + 2) {
+            let r = (base + y * row).assumingMemoryBound(to: UInt8.self)
+            for x in max(0, cx - 2)...min(w - 1, cx + 2) {
+                total += 1
+                if r[x] >= 128 { hits += 1 }
+            }
+        }
+        return hits * 2 >= total
+    }
+
+    /// Mélységfolt-növesztés a LiDAR képen: a ponttól indulva a folytonos, hasonló távolságú pixelek
+    /// befoglaló kerete. Így a bökés a tényleges tárgyat jelöli ki, nem egy fix méretű négyzetet.
+    private func depthRegion(at p: CGPoint, frame: ARFrame) -> (rect: CGRect, depth: Float)? {
+        guard let sd = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+        let dm = sd.depthMap
+        CVPixelBufferLockBaseAddress(dm, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(dm, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(dm) else { return nil }
+        let w = CVPixelBufferGetWidth(dm), h = CVPixelBufferGetHeight(dm)
+        let row = CVPixelBufferGetBytesPerRow(dm)
+        func depth(_ x: Int, _ y: Int) -> Float {
+            let v = (base + y * row).assumingMemoryBound(to: Float32.self)[x]
+            return v.isFinite && v > 0 ? v : 0
+        }
+        let sx = min(w - 1, max(0, Int(p.x * CGFloat(w)))), sy = min(h - 1, max(0, Int(p.y * CGFloat(h))))
+
+        // Kiinduló mélység: a 5x5 környezet mediánja
+        var seed: [Float] = []
+        for y in max(0, sy - 2)...min(h - 1, sy + 2) {
+            for x in max(0, sx - 2)...min(w - 1, sx + 2) { let v = depth(x, y); if v > 0 { seed.append(v) } }
+        }
+        guard seed.count >= 5 else { return nil }
+        seed.sort()
+        let d0 = seed[seed.count / 2]
+        let tol = max(0.10, d0 * 0.08)
+
+        var visited = [Bool](repeating: false, count: w * h)
+        var stack: [Int] = []
+        // A legközelebbi, d0-hoz illő pixelből indul
+        var start = -1
+        for y in max(0, sy - 2)...min(h - 1, sy + 2) {
+            for x in max(0, sx - 2)...min(w - 1, sx + 2) where start < 0 && abs(depth(x, y) - d0) < 0.02 + d0 * 0.01 {
+                start = y * w + x
+            }
+        }
+        guard start >= 0 else { return nil }
+        visited[start] = true
+        stack.append(start)
+        var minX = w, maxX = 0, minY = h, maxY = 0, count = 0
+        let limit = w * h * 35 / 100
+        while let i = stack.popLast() {
+            let x = i % w, y = i / w
+            count += 1
+            if count > limit { return nil }   // fal / padló: túl nagy, nem tárgy
+            minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+            let cur = depth(x, y)
+            let step = 0.03 + cur * 0.02
+            for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+                guard nx >= 0, ny >= 0, nx < w, ny < h else { continue }
+                let j = ny * w + nx
+                if visited[j] { continue }
+                let v = depth(nx, ny)
+                if v > 0, abs(v - cur) < step, abs(v - d0) < tol {
+                    visited[j] = true
+                    stack.append(j)
+                }
+            }
+        }
+        guard count >= 12 else { return nil }
+        var r = CGRect(x: CGFloat(minX) / CGFloat(w), y: CGFloat(minY) / CGFloat(h),
+                       width: CGFloat(maxX - minX + 1) / CGFloat(w), height: CGFloat(maxY - minY + 1) / CGFloat(h))
+        guard r.width < 0.7, r.height < 0.7 else { return nil }
+        r = r.insetBy(dx: -r.width * 0.06 - 0.01, dy: -r.height * 0.06 - 0.01).intersection(unitRect)
+        return (r, d0)
     }
 
     /// Az előző helyhez legjobban illő ember: először átfedés, ha nincs, a legközelebbi.
@@ -223,7 +369,8 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
 
     /// A téglalap (szűkítve) mélységpontjaiból a megadott percentilis.
     /// useMask: csak az ARKit által emberként jelölt pixelek számítanak.
-    private func sampleDepth(_ r: CGRect, shrink: CGFloat, useMask: Bool, percentile: Float, frame: ARFrame) -> Float? {
+    private func sampleDepth(_ r: CGRect, shrink: CGFloat, useMask: Bool, percentile: Float,
+                             near: Float? = nil, frame: ARFrame) -> Float? {
         guard let sd = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
         let dm = sd.depthMap
         let cm = sd.confidenceMap
@@ -264,6 +411,13 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
         guard vals.count >= 4 else { return nil }
+        if let n = near {
+            let tol = max(0.15, n * 0.12)
+            let close = vals.filter { abs($0 - n) < tol }
+            // Ha a pontok nagy része már máshol van, a tárgy tényleg elmozdult: nem kényszerítjük
+            guard close.count >= 4, close.count * 5 >= vals.count else { return nil }
+            vals = close
+        }
         vals.sort()
         return vals[min(vals.count - 1, Int(Float(vals.count) * percentile))]
     }
@@ -280,6 +434,8 @@ private func rawRect(fromVision r: CGRect) -> CGRect {
 private func visionRect(fromRaw r: CGRect) -> CGRect {
     CGRect(x: 1 - r.maxY, y: 1 - r.maxX, width: r.height, height: r.width)
 }
+
+private let unitRect = CGRect(x: 0, y: 0, width: 1, height: 1)
 
 private func area(_ r: CGRect) -> CGFloat { r.width * r.height }
 
