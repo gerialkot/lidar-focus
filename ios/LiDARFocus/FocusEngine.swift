@@ -21,7 +21,13 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
     @Published var distance: Float?
 
     private let queue = DispatchQueue(label: "focus.engine", qos: .userInteractive)
-    private let sequenceHandler = VNSequenceRequestHandler()
+    /// Az ARKit ide adja a képkockákat; a feldolgozás a `queue`-n fut. Ha az még foglalt, a képkocka eldobódik:
+    /// az Apple szerint ha a delegate túl sok ARFrame-et tart meg, a kamera leáll (ettől akadt az app).
+    private let deliveryQueue = DispatchQueue(label: "focus.delivery", qos: .userInteractive)
+    private let busyLock = NSLock()
+    private var busy = false
+    /// Követőnként új kezelő: a Vision típusonként korlátozott számú követőt enged, a régiek így felszabadulnak.
+    private var sequenceHandler = VNSequenceRequestHandler()
     private let humanRequest: VNDetectHumanRectanglesRequest = {
         let r = VNDetectHumanRectanglesRequest()
         r.upperBodyOnly = false
@@ -53,7 +59,7 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) { sem.insert(.smoothedSceneDepth) }
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) { sem.insert(.personSegmentationWithDepth) }
         session.delegate = self
-        session.delegateQueue = queue
+        session.delegateQueue = deliveryQueue
         queue.async {
             self.semantics = sem
             self.runConfig()
@@ -68,9 +74,11 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         // Ha a személyszegmentálás a mélységgel együtt nem fut, nélküle indítjuk újra
-        if semantics.contains(.personSegmentationWithDepth) {
-            semantics.remove(.personSegmentationWithDepth)
-            runConfig()
+        queue.async {
+            if self.semantics.contains(.personSegmentationWithDepth) {
+                self.semantics.remove(.personSegmentationWithDepth)
+                self.runConfig()
+            }
         }
     }
 
@@ -97,7 +105,7 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
     func clear() {
         queue.async {
             self.active = false
-            self.trackRequest = nil
+            self.releaseTracker()
             self.targetRect = nil
             self.faceRect = nil
             self.filter.reset()
@@ -114,6 +122,17 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: - Képkockánként (a saját sorunkon)
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        busyLock.lock()
+        if busy { busyLock.unlock(); return }   // még dolgozunk az előzőn: ezt eldobjuk
+        busy = true
+        busyLock.unlock()
+        queue.async {
+            self.process(frame)
+            self.busyLock.lock(); self.busy = false; self.busyLock.unlock()
+        }
+    }
+
+    private func process(_ frame: ARFrame) {
         guard viewSize != .zero else { return }
         frameCount += 1
         let toView = frame.displayTransform(for: .portrait, viewportSize: viewSize)
@@ -216,7 +235,7 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
         if let h = human, isPersonPixel(p, frame: frame) ?? true {
             targetKind = .person
             targetRect = h
-            trackRequest = nil
+            releaseTracker()
             faceRect = nil
             active = true
             missed = 0
@@ -243,10 +262,25 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func makeTracker(_ r: CGRect) {
+        releaseTracker()
         let req = VNTrackObjectRequest(detectedObjectObservation:
-            VNDetectedObjectObservation(boundingBox: visionRect(fromRaw: r)))
+            VNDetectedObjectObservation(boundingBox: visionRect(fromRaw: minSize(r))))
         req.trackingLevel = .accurate
         trackRequest = req
+    }
+
+    /// A régi követő lezárása (isLastFrame) és új kezelő, hogy ne fogyjon el a Vision követőkerete.
+    private func releaseTracker() {
+        trackRequest?.isLastFrame = true
+        trackRequest = nil
+        sequenceHandler = VNSequenceRequestHandler()
+    }
+
+    /// Túl kicsi keretre a Vision követő belső hibát dob (Code=9), ezért legalább 6%-os oldal.
+    private func minSize(_ r: CGRect) -> CGRect {
+        let s: CGFloat = 0.06
+        let w = max(r.width, s), h = max(r.height, s)
+        return CGRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h).intersection(unitRect)
     }
 
     /// LiDAR-alapú igazítás/újrakeresés: a keret közepén lévő, az eddigi távolsághoz illő mélységfolt.
@@ -260,7 +294,8 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
             targetRect = reg.rect
             missed = 0
         } else {
-            guard ratio > 0.4, ratio < 2.5 else { return }
+            // Csak valódi elcsúszásnál indítjuk újra a követőt, különben elveszítené a megtanult képét
+            guard ratio > 0.4, ratio < 2.5, iou(last, reg.rect) < 0.5 else { return }
             targetRect = lerp(last, reg.rect, 0.5)
         }
         makeTracker(targetRect!)
@@ -334,7 +369,9 @@ final class FocusEngine: NSObject, ObservableObject, ARSessionDelegate {
             minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
             let cur = depth(x, y)
             let step = 0.03 + cur * 0.02
-            for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+            for k in 0..<4 {   // 4 szomszéd, tömbfoglalás nélkül
+                let nx = k == 0 ? x + 1 : (k == 1 ? x - 1 : x)
+                let ny = k == 2 ? y + 1 : (k == 3 ? y - 1 : y)
                 guard nx >= 0, ny >= 0, nx < w, ny < h else { continue }
                 let j = ny * w + nx
                 if visited[j] { continue }
